@@ -23,7 +23,7 @@ aid-skills/
 | 技能 | 用途 | 依赖 |
 | --- | --- | --- |
 | [feishu-doc](skills/feishu-doc/) | 读取/搜索/修改飞书文档；总结开发任务；更新任务状态 | Python 3.8+（仅标准库）+ 飞书自建应用凭据 |
-| [dev-workflow](skills/dev-workflow/) | 三智能体开发流程：开发 → 测试 → CodeReview，worktree 功能分支上阶段即提交，合并主分支前人工把关 | 无（纯流程指令） |
+| [dev-workflow](skills/dev-workflow/) | 三智能体开发流程：开发 → 测试 → CodeReview，CR 通过后提交该 Phase（分支与 worktree 先与用户确认），合并主分支前人工把关 | 无（纯流程指令） |
 
 ## 安装
 
