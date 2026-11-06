@@ -29,21 +29,18 @@ aid-skills/
 
 ### 从 GitHub 安装（推荐）
 
-把仓库 clone 到本地，再把需要的技能目录复制到智能体的技能发现目录：
-
 ```bash
 git clone https://github.com/ethynic/aid-skills.git
-mkdir -p ~/.agents/skills
-cp -r aid-skills/skills/dev-workflow ~/.agents/skills/
+cp -r aid-skills/skills/<技能名> <智能体的技能发现目录>/
 ```
 
-也可以直接把这句话发给任意具备执行能力的智能体，让它自己完成安装：
+也可以直接把下面这句话发给任意具备执行能力的智能体，让它自己完成安装（`<技能名>` 换成实际技能）：
 
-> 请 clone <https://github.com/ethynic/aid-skills>，把其中的 `skills/dev-workflow` 安装到我的用户级技能目录 `~/.agents/skills/`（Windows 为 `%USERPROFILE%\.agents\skills\`），安装后列出可用的技能确认生效。
+> 请 clone <https://github.com/ethynic/aid-skills>，参照该仓库 README 的安装说明，把 `skills/<技能名>` 安装到你所在环境的用户级技能发现目录（常见智能体的目录见下表），安装完成后列出可用技能确认生效。
 
 ### 安装位置
 
-把技能目录复制或软链到智能体的技能发现目录即可：
+每个智能体都从自己的技能发现目录加载 `SKILL.md`。把技能目录复制或软链到对应位置即可：
 
 | 智能体 | 用户级（全局） | 项目级 |
 | --- | --- | --- |
