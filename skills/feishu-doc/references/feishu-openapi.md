@@ -18,6 +18,10 @@
 | list | `GET /drive/v1/files?folder_token=` | `drive:drive:readonly` |
 | wiki-spaces | `GET /wiki/v2/spaces` | `wiki:wiki:readonly` |
 | wiki-list | `GET /wiki/v2/spaces/{space_id}/nodes` | `wiki:wiki:readonly` |
+| search | `POST /suite/docs-api/search/object`（body: `search_key`；仅用户登录态有效） | 用户身份 |
+| sheet-list / 元信息 | `GET /sheets/v3/spreadsheets/{token}/sheets/query` | `sheets:spreadsheet.meta:read` |
+| sheet-read | `GET /sheets/v2/spreadsheets/{token}/values/{range}`（params: `valueRenderOption=ToString`） | `sheets:spreadsheet:read` |
+| sheet-set | `PUT /sheets/v2/spreadsheets/{token}/values`（body: `{"valueRange": {"range": "...", "values": [["x"]]}}`） | `sheets:spreadsheet:write_only` |
 
 ## 双身份鉴权说明
 
@@ -54,7 +58,8 @@ CLI 已自动处理：token 过期（刷新重试一次）、限流 code `999914
 
 - **创建文档**：`POST /docx/v1/documents`（body: `title`，可选 `folder_token`）。注意：不传 folder 时文档创建在应用空间根目录，用户可能看不到——建议先让用户分享一个文件夹给应用，用它的 folder_token。
 - **批量插入**：`PATCH /docx/v1/documents/{id}/blocks/{block_id}/descendant` 可一次插入多块，替代循环 `children`。
-- **多维表格/电子表格**：分别走 `/bitable/v1/apps/...` 与 `/sheets/v3/...`，建议做成独立技能而不是塞进本技能。
+- **多维表格**：走 `/bitable/v1/apps/...`，数据模型差异大，建议做成独立技能。
+- **电子表格**：工作表元信息在 v3 `sheets/query`，单元格值读写都在 v2 `values` 端点（range 形如 `{sheet_id}!A1:H50`）；URL 里 `sheet=` 查询参数即工作表 ID，CLI 已自动利用它选中正确的工作表。
 - **全文搜索**：需要 user_access_token（OAuth），自建应用 tenant token 不支持；维持「文件夹 + 知识库树」定位即可。
 
 ## 安全红线

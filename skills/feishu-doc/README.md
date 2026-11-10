@@ -17,13 +17,16 @@
 | 能力 | 命令 |
 | --- | --- |
 | 读取文档为 Markdown（总结需求、提取任务） | `read` |
+| 按标题关键词搜索文档 | `search`（需用户登录态） |
 | 按内容定位文档块 | `find` |
 | 修改指定块的文本（更新状态、改正描述） | `update` / `set-status` |
 | 在文末追加内容（开发完成记录等） | `append` |
+| 读取电子表格 / 修改单元格（任务清单表格） | `sheet-read` / `sheet-set` / `sheet-list` |
+| 下载表格里用户上传的截图（供智能体看图理解问题） | `sheet-images` |
 | 浏览云空间文件夹、知识库文档树 | `list` / `wiki-spaces` / `wiki-list` |
 | 浏览器授权登录 / 查看登录用户 | `login` / `logout` / `whoami` |
 
-仅支持**新版文档（docx）**与**知识库（wiki）节点**。旧版 docs、电子表格、多维表格暂不支持。
+支持**新版文档（docx）**、**知识库（wiki）节点**、**电子表格（sheet）读取与改单元格**。旧版 docs、多维表格暂不支持。
 
 ---
 
@@ -46,6 +49,8 @@
 | 查看、评论、编辑和管理版式文档 | `docx:document` | 读 + 改 + 追加文档 |
 | 查看、评论和下载云空间中所有文件 | `drive:drive:readonly` | `list` 列出文件夹 |
 | 查看知识库 | `wiki:wiki:readonly` | 知识库浏览、wiki 链接解析 |
+| 查看、评论和下载电子表格 | `sheets:spreadsheet:read`、`sheets:spreadsheet.meta:read` | `sheet-read` / `sheet-list` |
+| 编辑电子表格 | `sheets:spreadsheet:write_only` | `sheet-set` 改单元格 |
 
 ### 3. 配置重定向 URL（方式 A 必需）
 
@@ -117,6 +122,7 @@ python scripts/feishu_cli.py read <你的文档链接>     # 输出 Markdown
 | `login` 报 20027 | 授权的 scope 没在应用后台开通 → 权限管理里申请（第 2 步），重新 `login` |
 | `login` 报 20010 | 你不在应用可用范围 → 发布时可用范围包含你（或全体成员） |
 | `login` 报 20071 | 重定向 URL 与后台配置不一致 → 核对第 3 步（含端口） |
+| 后台添加 `127.0.0.1` 重定向被拒 | 改加 `http://localhost:5178/callback`，登录时用 `login --redirect-uri http://localhost:5178/callback` 保持两端一致 |
 | 登录隔了很久失效 | refresh_token 约 7 天不用会过期 → 重新 `login`（经常使用则永不过期） |
 | tenant 模式报无权限 | 应用没发布、或没把应用加为文档协作者/知识库成员 |
 | `read` 能读，`update` 报权限 | tenant 模式下协作者权限选了「可阅读」；改成「可编辑」，或改用 `login` 模式 |

@@ -22,7 +22,7 @@ aid-skills/
 
 | 技能 | 用途 | 依赖 |
 | --- | --- | --- |
-| [feishu-doc](skills/feishu-doc/) | 读取/搜索/修改飞书文档；总结开发任务；更新任务状态 | Python 3.8+（仅标准库）+ 飞书自建应用凭据 |
+| [feishu-doc](skills/feishu-doc/) | 读取/搜索/修改飞书文档与电子表格；总结开发任务；更新任务状态 | Python 3.8+（仅标准库）+ 飞书自建应用凭据 |
 | [dev-workflow](skills/dev-workflow/) | 三智能体开发流程：开发 → 测试 → CodeReview，CR 通过后提交该 Phase（分支与 worktree 先与用户确认），合并主分支前人工把关 | 无（纯流程指令） |
 
 ## 安装
@@ -44,10 +44,12 @@ cp -r aid-skills/skills/<技能名> <智能体的技能发现目录>/
 
 | 智能体 | 用户级（全局） | 项目级 |
 | --- | --- | --- |
-| Claude Code | `~/.claude/skills/` | `<项目>/.claude/skills/` |
 | ZCode | `~/.agents/skills/`（或 `~/.zcode/skills/`） | `<项目>/.agents/skills/`（或 `.zcode/skills/`） |
-| Codex CLI | `~/.codex/skills/` | `<项目>/.codex/skills/`（若版本支持） |
+| Codex CLI | `~/.agents/skills/`（新版已认通用目录；旧版用 `~/.codex/skills/`） | 同左 |
+| Claude Code | `~/.claude/skills/` | `<项目>/.claude/skills/` |
 | 其他兼容智能体 | 参照其文档的 skills 目录 | 同左 |
+
+> 一份安装多处生效：ZCode 与新版 Codex 都从 `~/.agents/skills/` 加载，装一次即可，凭据也是共享的。
 
 ```bash
 # 复制安装（Git Bash / macOS / Linux）

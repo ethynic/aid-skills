@@ -13,18 +13,22 @@
   login        浏览器 OAuth 授权登录（推荐；以用户身份访问文档，免逐篇授权）
   logout       清除本机登录态
   whoami       查看当前登录用户
-  read         读取文档（Markdown / 纯文本 / 块 JSON）
+  read         读取文档（Markdown / 纯文本 / 块 JSON；表格链接自动识别）
   find         按内容查找块，拿到 block_id
   append       在文档末尾（或指定父块下）追加块
   update       替换某个块的文本
   set-status   修改「状态: xxx」约定行（任务状态回写）
+  search       按标题关键词搜索文档（需用户登录态）
   list         列出云空间某文件夹下的文件
   wiki-spaces  列出知识库空间
   wiki-list    列出知识库节点（文档树）
+  sheet-list   列出电子表格的工作表
+  sheet-read   读取电子表格为 Markdown
+  sheet-set    修改电子表格单元格
   selftest     本地自测（不访问网络）
 
-支持文档类型：新版文档 docx、知识库 wiki 节点。
-不支持：旧版 docs、电子表格 sheets、多维表格 base。
+支持文档类型：新版文档 docx、知识库 wiki 节点、电子表格 sheet（读取+改单元格）。
+不支持：旧版 docs、多维表格 base。
 """
 
 import argparse
@@ -34,6 +38,7 @@ import os
 import re
 import secrets
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -46,6 +51,7 @@ UA = "feishu-doc-skill/1.0"
 CONFIG_DIR = Path.home() / ".config" / "feishu-doc"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 TOKEN_CACHE = CONFIG_DIR / "tenant_token_cache.json"
+ALIASES_FILE = CONFIG_DIR / "aliases.json"
 USER_TOKEN_FILE = CONFIG_DIR / "user_token.json"
 DEFAULT_LOGIN_PORT = 5178
 DEFAULT_SCOPES = "offline_access docx:document drive:drive:readonly wiki:wiki:readonly"
@@ -109,7 +115,7 @@ def load_config():
     if not CONFIG_FILE.exists():
         return None
     try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:  # utf-8-sig 兼容 PowerShell 写入的 BOM
             data = json.load(f)
         return data if isinstance(data, dict) else None
     except Exception as e:
@@ -366,8 +372,29 @@ def call_api(method, path, creds, params=None, body=None, auth="auto"):
 
 # ---------------------------------------------------------------- 文档定位
 
-def parse_doc_ref(ref, prefer_wiki=False):
-    """解析文档链接或裸 token，返回 (类型, token)。"""
+def alias_load():
+    try:
+        with open(CONFIG_DIR / "aliases.json", "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def alias_save(mapping):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_DIR / "aliases.json", "w", encoding="utf-8") as f:
+        json.dump(mapping, f, ensure_ascii=False, indent=2)
+
+
+def alias_lookup(name):
+    if not name:
+        return None
+    return alias_load().get(name.strip())
+
+
+def parse_doc_ref(ref, prefer_wiki=False, _depth=0):
+    """解析文档链接或裸 token，返回 (类型, token)。支持 pin 过的文档名（别名）。"""
     ref = ref.strip().strip("\"'")
     m = DOC_URL_RE.search(ref)
     if m:
@@ -384,34 +411,208 @@ def parse_doc_ref(ref, prefer_wiki=False):
         if prefer_wiki or ref.lower().startswith("wik"):
             return "wiki", ref
         return "docx", ref
-    raise FeishuError("无法识别的文档链接或 token: %s" % ref)
+    if _depth == 0:  # 不是链接/token → 试文档名别名
+        aliased = alias_lookup(ref)
+        if aliased:
+            return parse_doc_ref(aliased, prefer_wiki, _depth=1)
+    raise FeishuError(
+        "无法识别的文档链接或 token: %s\n"
+        "若是文档名：先让用户贴一次链接，然后 pin \"%s\" <链接> 收藏，之后即可用名字直接访问；"
+        "也可先 search <关键词> 搜索。" % (ref, ref))
 
 
-def _resolve(kind, token, creds):
-    if kind == "docx":
-        return token
+def _wiki_node(token, creds):
     data = call_api("GET", "/wiki/v2/spaces/get_node", creds, params={"token": token})
-    node = data.get("node") or {}
-    if (node.get("obj_type") or "").lower() != "docx":
-        raise FeishuError("该知识库节点指向 %s 类型（当前仅支持 docx 文档）: %s"
-                          % (node.get("obj_type") or "?", node.get("title") or ""))
-    return node.get("obj_token")
+    return data.get("node") or {}
+
+
+def _non_docx_hint(obj_type, title):
+    if obj_type == "sheet":
+        return ("该链接是电子表格「%s」。可直接 read 读取，或用 sheet read / sheet set "
+                "精确操作（sheet list 查看工作表）。" % (title or "未命名"))
+    if obj_type == "bitable":
+        return "该链接是多维表格（bitable），暂不支持。"
+    return "该知识库节点指向 %s 类型（当前支持 docx 文档与电子表格 sheet）: %s" % (obj_type or "?", title)
+
+
+def _url_worksheet_hint(ref):
+    """从 URL 的 sheet= 查询参数中提取工作表提示。"""
+    if "sheet=" not in ref:
+        return None
+    try:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(ref.strip().strip("\"'")).query)
+        vals = qs.get("sheet") or []
+        return vals[0] if vals else None
+    except Exception:
+        return None
+
+
+def resolve_node(ref, creds, prefer_wiki=False):
+    """解析为 (类型, 对象token, 工作表提示)。类型: docx / sheet / bitable / ..."""
+    s = ref.strip().strip("\"'")
+    if "://" not in s and not re.fullmatch(r"[0-9A-Za-z]{8,64}", s):
+        aliased = alias_lookup(s)
+        if aliased:
+            ref = aliased  # 用收藏的完整链接，保留 sheet= 等上下文
+    kind, token = parse_doc_ref(ref, prefer_wiki)
+    hint = _url_worksheet_hint(ref)
+    if kind == "docx":
+        return "docx", token, hint
+    node = _wiki_node(token, creds)
+    obj_type = (node.get("obj_type") or "unknown").lower()
+    return obj_type, node.get("obj_token"), hint
 
 
 def resolve_document(ref, creds, prefer_wiki=False):
-    """把链接/token 解析为 document_id。裸 token 解析失败时自动换一种解释重试。"""
+    """把链接/token 解析为 docx 的 document_id；其他类型给出明确指引。裸 token 失败时自动换一种解释重试。"""
     kind, token = parse_doc_ref(ref, prefer_wiki)
     bare = "://" not in ref
+
+    def _as_docx(k, t):
+        if k == "docx":
+            return t
+        node = _wiki_node(t, creds)
+        ot = (node.get("obj_type") or "").lower()
+        if ot != "docx":
+            raise FeishuError(_non_docx_hint(ot, node.get("title") or ""))
+        return node.get("obj_token")
+
     try:
-        return _resolve(kind, token, creds)
+        return _as_docx(kind, token)
     except FeishuError as e:
         if not bare:
             raise
-        other = "docx" if kind == "wiki" else "wiki"
         try:
-            return _resolve(other, token, creds)
+            return _as_docx("docx" if kind == "wiki" else "wiki", token)
         except FeishuError:
             raise e
+
+
+# ---------------------------------------------------------------- 电子表格 (sheet)
+
+def resolve_spreadsheet(ref, creds):
+    """解析链接/token 为电子表格 token，返回 (spreadsheet_token, 工作表提示)。"""
+    kind, token, hint = resolve_node(ref, creds)
+    if kind == "docx":
+        raise FeishuError("该链接是 docx 文档，直接用 read 读取即可。")
+    if kind != "sheet":
+        raise FeishuError(_non_docx_hint(kind, ""))
+    return token, hint
+
+
+def get_worksheets(ss_token, creds):
+    data = call_api("GET", "/sheets/v3/spreadsheets/%s/sheets/query" % ss_token, creds)
+    return data.get("sheets") or []
+
+
+def pick_worksheet(sheets, sel):
+    if not sel:
+        return sheets[0]
+    for s in sheets:
+        if sel in (s.get("sheet_id"), s.get("title")) or str(s.get("index")) == sel:
+            return s
+    raise FeishuError("找不到工作表「%s」。可用工作表: %s"
+                      % (sel, "; ".join("%s(id=%s)" % (s.get("title"), s.get("sheet_id"))
+                                        for s in sheets)))
+
+
+def col_letter(n):
+    """1-based 列号转字母：1→A, 26→Z, 27→AA, 52→AZ。"""
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def sheet_values(ss_token, creds, rng):
+    data = call_api("GET", "/sheets/v2/spreadsheets/%s/values/%s"
+                    % (ss_token, urllib.parse.quote(rng, safe="!:")),
+                    creds, params={"valueRenderOption": "ToString",
+                                   "dateTimeRenderOption": "FormattedString"})
+    d = data.get("valueRange") or data
+    return d.get("values") or []
+
+
+def sheet_values_raw(ss_token, creds, rng):
+    """读取原始值（不带渲染选项）：图片单元格返回 embed-image 元素列表。"""
+    data = call_api("GET", "/sheets/v2/spreadsheets/%s/values/%s"
+                    % (ss_token, urllib.parse.quote(rng, safe="!:")), creds)
+    d = data.get("valueRange") or data
+    return d.get("values") or []
+
+
+def _parse_range_anchors(rng):
+    """解析 工作表ID!A3:F20，返回 (sheet_id, 起始列号, 起始行, 结束列号, 结束行)。"""
+    m = re.fullmatch(r"([0-9A-Za-z]+)!([A-Z]+)(\d+):([A-Z]+)(\d+)", rng)
+    if not m:
+        return None
+
+    def col_idx(letters):
+        n = 0
+        for ch in letters:
+            n = n * 26 + (ord(ch) - 64)
+        return n
+
+    return (m.group(1), col_idx(m.group(2)), int(m.group(3)),
+            col_idx(m.group(4)), int(m.group(5)))
+
+
+_IMG_MAGIC = ((b"\x89PNG", ".png"), (b"\xff\xd8", ".jpg"), (b"GIF8", ".gif"))
+
+
+def _sniff_image_ext(data):
+    for magic, ext in _IMG_MAGIC:
+        if data.startswith(magic):
+            return ext
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return ".png"
+
+
+_EMBED_IMG_RE = re.compile(r"\[\{'id': \d+, 'type': 'embed-image'\}\]")
+
+
+def values_to_markdown(values, max_cell=300):
+    if not values:
+        return "(空表)"
+    width = max(len(r) for r in values)
+    norm = [list(r) + [""] * (width - len(r)) for r in values]
+
+    def clean(v):
+        s = _EMBED_IMG_RE.sub("[图片]", str(v if v is not None else ""))
+        return s.replace("\n", "<br>").replace("|", "\\|")[:max_cell]
+
+    lines = ["| 行 | " + " | ".join(clean(c) for c in norm[0]) + " |",
+             "| " + " | ".join(["---"] * (width + 1)) + " |"]
+    for i, r in enumerate(norm[1:], start=2):
+        lines.append("| %d | " % i + " | ".join(clean(c) for c in r) + " |")
+    lines.append("")
+    lines.append("说明: 「行」列为电子表格实际行号，第 1 行视为表头。修改单元格: "
+                 "sheet set <链接> --cell <列+行号，如 C5> --value <新值>。"
+                 "「[图片]」为单元格图片，用 sheet-images <链接> --row <行号> 下载后查看。")
+    return "\n".join(lines)
+
+
+def spreadsheet_to_text(ss_token, creds, sel=None, rng=None):
+    sheets = get_worksheets(ss_token, creds)
+    if not sheets:
+        raise FeishuError("该电子表格没有工作表")
+    ws = pick_worksheet(sheets, sel)
+    gp = ws.get("grid_properties") or {}
+    rows = int(gp.get("row_count") or 0)
+    cols = int(gp.get("column_count") or 0)
+    if not rng:
+        rng = "%s!A1:%s%d" % (ws.get("sheet_id"), col_letter(min(cols, 52) or 26),
+                              min(rows, 2000) or 200)
+    values = sheet_values(ss_token, creds, rng)
+    note = ""
+    if len(values) > 400:
+        values = values[:400]
+        note = "\n（仅显示前 400 行，用 --range <工作表ID!A200:Z400> 继续读取）"
+    header = "工作表「%s」(sheet_id=%s) 共%s行×%s列，读取范围 %s" % (
+        ws.get("title"), ws.get("sheet_id"), rows, cols, rng)
+    return header + "\n\n" + values_to_markdown(values) + note
 
 
 # ---------------------------------------------------------------- 块处理
@@ -646,7 +847,7 @@ def cmd_setup(args, creds):
 
 def cmd_login(args, creds):
     port = args.port
-    redirect_uri = "http://127.0.0.1:%d/callback" % port
+    redirect_uri = args.redirect_uri or ("http://127.0.0.1:%d/callback" % port)
     state = secrets.token_hex(16)
     auth_url = build_authorize_url(creds, port, state, scope=args.scope)
     result = {"code": None, "error": None, "state": None}
@@ -735,6 +936,37 @@ def cmd_logout(args, creds):
         print("本机没有登录态")
 
 
+def cmd_pin(args, creds):
+    link = args.link.strip().strip("\"'")
+    kind, token = parse_doc_ref(link)  # 能解析才收
+    mapping = alias_load()
+    mapping[args.name.strip()] = link
+    alias_save(mapping)
+    print("✓ 已收藏: %s → [%s] %s" % (args.name.strip(), kind, token))
+    print("  之后可直接 read / find / sheet-read \"%s\" 按名访问" % args.name.strip())
+    return 0
+
+
+def cmd_unpin(args, creds):
+    mapping = alias_load()
+    if mapping.pop(args.name.strip(), None) is None:
+        print("没有这个收藏: %s" % args.name)
+        return 1
+    alias_save(mapping)
+    print("✓ 已删除收藏: %s" % args.name.strip())
+    return 0
+
+
+def cmd_pinned(args, creds):
+    mapping = alias_load()
+    if not mapping:
+        print("（还没有收藏。用 pin <文档名> <链接> 添加，之后可用文档名直接访问）")
+        return 0
+    for k, v in mapping.items():
+        print("%s\n      %s" % (k, v))
+    return 0
+
+
 def cmd_whoami(args, creds):
     data = call_api("GET", "/authen/v1/user_info", creds, auth="user")
     rec = load_user_token_record() or {}
@@ -748,7 +980,20 @@ def cmd_whoami(args, creds):
 
 
 def cmd_read(args, creds):
-    doc_id = resolve_document(args.doc, creds, prefer_wiki=getattr(args, "wiki", False))
+    kind, obj_id, hint = resolve_node(args.doc, creds, prefer_wiki=getattr(args, "wiki", False))
+    if kind == "sheet":
+        if args.json or args.raw:
+            print("提示: 电子表格不支持 --json/--raw，按 Markdown 输出。", file=sys.stderr)
+        text = spreadsheet_to_text(obj_id, creds, sel=hint)
+        if args.out:
+            Path(args.out).write_text(text, encoding="utf-8")
+            print("✓ 已写入 %s（%d 字符）" % (args.out, len(text)))
+        else:
+            print(text)
+        return 0
+    if kind != "docx":
+        raise FeishuError(_non_docx_hint(kind, ""))
+    doc_id = obj_id
     if args.json:
         text = json.dumps({"document_id": doc_id, "blocks": get_blocks(doc_id, creds)},
                           ensure_ascii=False, indent=2)
@@ -906,6 +1151,122 @@ def cmd_wiki_list(args, creds):
     return 0
 
 
+def cmd_search(args, creds):
+    """按标题关键词搜索文档（需用户登录态）。"""
+    data = call_api("POST", "/suite/docs-api/search/object", creds,
+                    body={"search_key": args.query,
+                          "page_size": min(max(args.limit, 1), 50), "offset": 0})
+    ents = (data.get("docs_entities") or []) if isinstance(data, dict) else []
+    if not ents:
+        print("（无匹配）")
+        return 0
+    m = re.match(r"^(https?://[^/]+)", creds["base"])
+    host = m.group(1) if m else "https://open.feishu.cn".replace("open.", "")
+    path_by_type = {"docx": "/docx/", "doc": "/docs/", "sheet": "/sheets/", "bitable": "/base/"}
+    for it in ents:
+        t = it.get("docs_type")
+        tok = it.get("docs_token")
+        path = path_by_type.get(t)
+        url = (host + path + tok) if path else "(%s: %s)" % (t, tok)
+        print("[%s] %s" % (t, it.get("title")))
+        print("      %s" % url)
+    print("---\n共 %d 条。docx 链接可直接 read；电子表格用 sheet read / sheet set。" % len(ents))
+    return 0
+
+
+def cmd_sheet_list(args, creds):
+    ss, _hint = resolve_spreadsheet(args.doc, creds)
+    sheets = get_worksheets(ss, creds)
+    for s in sheets:
+        gp = s.get("grid_properties") or {}
+        print("%s  「%s」  (%s行×%s列)" % (s.get("sheet_id"), s.get("title"),
+                                          gp.get("row_count"), gp.get("column_count")))
+    print("---\n用 sheet read <链接> --sheet <名称或ID> 读取；read <链接> 默认读第一个工作表。")
+    return 0
+
+
+def cmd_sheet_read(args, creds):
+    ss, hint = resolve_spreadsheet(args.doc, creds)
+    text = spreadsheet_to_text(ss, creds, sel=args.sheet or hint, rng=args.range)
+    if args.out:
+        Path(args.out).write_text(text, encoding="utf-8")
+        print("✓ 已写入 %s（%d 字符）" % (args.out, len(text)))
+    else:
+        print(text)
+    return 0
+
+
+def cmd_sheet_set(args, creds):
+    ss, hint = resolve_spreadsheet(args.doc, creds)
+    sheets = get_worksheets(ss, creds)
+    ws = pick_worksheet(sheets, args.sheet or hint)
+    cell = args.cell.strip().upper()
+    if not re.fullmatch(r"[A-Z]+[0-9]+", cell):
+        raise FeishuError("单元格格式不正确（示例: C5）。--cell 列号+行号，如 C5")
+    rng = "%s!%s:%s" % (ws.get("sheet_id"), cell, cell)  # 飞书 v2 端点不接受单锚点范围（如 I8），必须双锚点
+    old = sheet_values(ss, creds, rng)
+    old_v = old[0][0] if old and old[0] else ""
+    call_api("PUT", "/sheets/v2/spreadsheets/%s/values" % ss, creds,
+             body={"valueRange": {"range": rng, "values": [[args.value]]}})
+    print("✓ 单元格已更新 「%s」!%s" % (ws.get("title"), cell))
+    print("  旧: %s" % old_v)
+    print("  新: %s" % args.value)
+    return 0
+
+
+def cmd_sheet_images(args, creds):
+    """扫描范围内的单元格图片并下载到本地，供智能体查看。"""
+    ss, hint = resolve_spreadsheet(args.doc, creds)
+    sheets = get_worksheets(ss, creds)
+    ws = pick_worksheet(sheets, args.sheet or hint)
+    sid = ws.get("sheet_id")
+    gp = ws.get("grid_properties") or {}
+    cols = int(gp.get("column_count") or 26)
+    if args.row:
+        rng = "%s!A%d:%s%d" % (sid, args.row, col_letter(min(cols, 52)), args.row)
+        start_row, start_col = args.row, 1
+    elif args.range:
+        rng = args.range
+        anchors = _parse_range_anchors(rng.upper())
+        if not anchors:
+            raise FeishuError("范围格式应为 工作表ID!A1:F20（需带工作表ID前缀，sheet-list 可查）")
+        _, start_col, start_row, _, _ = anchors
+    else:
+        raise FeishuError("请指定 --row <行号>（取该行图片）或 --range <工作表ID!A1:F20>（扫一片）")
+    values = sheet_values_raw(ss, creds, rng)
+    found = []
+    for i, row_vals in enumerate(values):
+        for j, cell in enumerate(row_vals):
+            # 图片单元格：裸返回时是 dict，多图时可能是 list
+            elements = cell if isinstance(cell, list) else [cell]
+            for k, el in enumerate(elements):
+                if isinstance(el, dict) and el.get("type") == "embed-image" and el.get("fileToken"):
+                    found.append((start_row + i, col_letter(start_col + j), k, el["fileToken"]))
+    if not found:
+        print("该范围没有发现单元格图片")
+        return 0
+    token = get_user_token(creds) or get_token(creds)
+    out_dir = Path(args.out or "feishu-images")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    saved, failed = [], 0
+    for row_no, col_l, k, ft in found[:max(args.limit, 1)]:
+        status, data = raw_http("GET", "%s/drive/v1/medias/%s/download" % (creds["base"], ft),
+                                headers={"Authorization": "Bearer " + token})
+        if status != 200 or not data:
+            failed += 1
+            print("行%d 列%s  %s  ✗ 下载失败 (HTTP %s)" % (row_no, col_l, ft, status))
+            continue
+        path = out_dir / ("r%d_%s_%d_%s%s" % (row_no, col_l, k + 1, ft[:8], _sniff_image_ext(data)))
+        path.write_bytes(data)
+        saved.append(path)
+        print("行%d 列%s  %s  ->  %s (%d bytes)" % (row_no, col_l, ft, path, len(data)))
+    print("---\n发现 %d 张，已下载 %d 张%s到 %s；用图片查看工具(Read)逐张打开即可看到内容。"
+          % (len(found), len(saved), ("，失败 %d 张" % failed) if failed else "", out_dir))
+    if len(found) > max(args.limit, 1):
+        print("（超出 --limit %d 的 %d 张未下载，可加大 --limit 或缩小范围）" % (args.limit, len(found) - max(args.limit, 1)))
+    return 0
+
+
 # ---------------------------------------------------------------- 自测
 
 def run_selftest():
@@ -954,6 +1315,26 @@ def run_selftest():
     check("authorize url 域名", u.startswith("https://accounts.feishu.cn/open-apis/authen/v1/authorize"))
     check("authorize url 参数", ("client_id=cli_x" in u) and ("offline_access" in u)
           and ("127.0.0.1%3A5178" in u))
+    check("col_letter", col_letter(1) == "A" and col_letter(26) == "Z"
+          and col_letter(27) == "AA" and col_letter(52) == "AZ")
+    smd = values_to_markdown([["任务", "状态"], ["登录", "待开发"], ["支付", "已完成"]])
+    for frag in ["| 行 | 任务 | 状态 |", "| 2 | 登录 | 待开发 |", "| 3 | 支付 | 已完成 |"]:
+        check("sheet render: %s" % frag, frag in smd)
+    imd = values_to_markdown([["备注"], ["[{'id': 1, 'type': 'embed-image'}]"]])
+    check("sheet render 图片占位符", "[图片]" in imd and "embed-image" not in imd)
+    check("图片类型嗅探", _sniff_image_ext(b"\x89PNG\r\n") == ".png"
+          and _sniff_image_ext(b"\xff\xd8\xff") == ".jpg")
+
+    global CONFIG_DIR
+    _orig_dir = CONFIG_DIR
+    try:  # 别名机制（隔离到临时目录，不碰真实收藏）
+        CONFIG_DIR = Path(tempfile.mkdtemp(prefix="feishu_alias_test_"))
+        alias_save({"测试文档": "https://aa.feishu.cn/wiki/wikcnTEST1"})
+        check("alias 存取", alias_lookup("测试文档") == "https://aa.feishu.cn/wiki/wikcnTEST1")
+        check("alias 解析", parse_doc_ref("测试文档") == ("wiki", "wikcnTEST1"))
+        check("alias 未命中", alias_lookup("不存在的文档") is None)
+    finally:
+        CONFIG_DIR = _orig_dir
 
     if failures:
         print("\n%d 项自测失败" % len(failures))
@@ -977,6 +1358,10 @@ EXAMPLES = """示例:
   python feishu_cli.py list
   python feishu_cli.py wiki-spaces
   python feishu_cli.py wiki-list <space_id>
+  python feishu_cli.py search 修改清单                       # 按标题搜文档（需登录态）
+  python feishu_cli.py sheet-read <表格链接> [--sheet 工作表名]
+  python feishu_cli.py sheet-set <表格链接> --cell C5 --value 已完成
+  python feishu_cli.py sheet-images <表格链接> --row 8          # 下载该行用户上传的截图
 """
 
 
@@ -1007,6 +1392,9 @@ def build_parser():
     sp = sub.add_parser("login", parents=[common], help="浏览器授权登录（推荐，免逐篇文档授权）")
     sp.add_argument("--port", type=int, default=DEFAULT_LOGIN_PORT,
                     help="本地回调端口（默认 %d，需与应用后台重定向 URL 一致）" % DEFAULT_LOGIN_PORT)
+    sp.add_argument("--redirect-uri",
+                    help="覆盖回调地址（默认 http://127.0.0.1:<port>/callback；"
+                         "若后台只允许 localhost 形式，用 --redirect-uri http://localhost:<port>/callback 保持两端一致）")
     sp.add_argument("--scope", help="覆盖授权 scope（默认: %s）" % DEFAULT_SCOPES)
     sp.set_defaults(func=cmd_login)
 
@@ -1065,6 +1453,50 @@ def build_parser():
     sp.add_argument("--parent", help="父节点 node_token（默认顶层）")
     sp.set_defaults(func=cmd_wiki_list)
 
+    sp = sub.add_parser("search", parents=[common], help="按标题关键词搜索文档（需用户登录态）")
+    sp.add_argument("query", help="标题关键词")
+    sp.add_argument("--limit", type=int, default=20, help="返回条数（默认 20，最多 50）")
+    sp.set_defaults(func=cmd_search)
+
+    sp = sub.add_parser("pin", help="收藏文档别名（之后可用文档名直接访问）")
+    sp.add_argument("name", help="文档名/别名")
+    sp.add_argument("link", help="文档链接或 token")
+    sp.set_defaults(func=cmd_pin)
+
+    sp = sub.add_parser("unpin", help="删除文档别名收藏")
+    sp.add_argument("name", help="文档名/别名")
+    sp.set_defaults(func=cmd_unpin)
+
+    sp = sub.add_parser("pinned", help="列出全部文档别名收藏")
+    sp.set_defaults(func=cmd_pinned)
+
+    sp = sub.add_parser("sheet-list", parents=[common], help="列出电子表格的工作表")
+    sp.add_argument("doc", help="表格链接或 token")
+    sp.set_defaults(func=cmd_sheet_list)
+
+    sp = sub.add_parser("sheet-read", parents=[common], help="读取电子表格为 Markdown")
+    sp.add_argument("doc", help="表格链接或 token")
+    sp.add_argument("--sheet", help="工作表名称或 sheet_id（默认 URL 指定的或第一个）")
+    sp.add_argument("--range", help="范围（如 aTxhcc!A1:H50，默认有效区域）")
+    sp.add_argument("--out", help="写入文件而不是标准输出")
+    sp.set_defaults(func=cmd_sheet_read)
+
+    sp = sub.add_parser("sheet-set", parents=[common], help="修改电子表格单元格")
+    sp.add_argument("doc", help="表格链接或 token")
+    sp.add_argument("--cell", required=True, help="单元格（列+行号，如 C5）")
+    sp.add_argument("--value", required=True, help="新值")
+    sp.add_argument("--sheet", help="工作表名称或 sheet_id（默认 URL 指定的或第一个）")
+    sp.set_defaults(func=cmd_sheet_set)
+
+    sp = sub.add_parser("sheet-images", parents=[common], help="下载单元格图片到本地（供查看）")
+    sp.add_argument("doc", help="表格链接、token 或已 pin 的文档名")
+    sp.add_argument("--row", type=int, help="只取该行的图片")
+    sp.add_argument("--range", help="扫描范围（工作表ID!A1:F20）")
+    sp.add_argument("--sheet", help="工作表名称或 sheet_id")
+    sp.add_argument("--out", default="feishu-images", help="保存目录（默认 ./feishu-images）")
+    sp.add_argument("--limit", type=int, default=20, help="最多下载张数（默认 20）")
+    sp.set_defaults(func=cmd_sheet_images)
+
     sp = sub.add_parser("selftest", help="本地自测（不访问网络）")
     sp.set_defaults(func=lambda a, c: run_selftest())
 
@@ -1078,13 +1510,19 @@ def main(argv=None):
     try:
         if args.command == "selftest":
             return run_selftest()
-        if args.command == "logout":
-            return cmd_logout(args, None)
+        if args.command in ("logout", "pin", "unpin", "pinned"):
+            return args.func(args, None)
         creds = resolve_creds(args)
         return args.func(args, creds)
     except FeishuError as e:
         print(str(e), file=sys.stderr)
         return 1
+    except BrokenPipeError:  # 输出被 head 等管道截断时安静退出
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        return 0
     except KeyboardInterrupt:
         return 130
 
